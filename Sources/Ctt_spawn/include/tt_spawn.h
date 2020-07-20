@@ -16,4 +16,9 @@ typedef struct {
     int writing;
 } tt_pipe;
 
-pid_t tt_spawn_core(const char *path, const char **argv, const int argv_count, const char **env_keys, const char **env_values, int env_count, const char *wd, tt_pipe input, tt_pipe output, tt_pipe error, tt_pipe notify);
+typedef struct {
+	pid_t launchResult;
+	void* stackAllocation;
+} tt_spawn_result;
+
+tt_spawn_result tt_spawn_core(const char *path, const char **argv, const int argv_count, const char **env_keys, const char **env_values, int env_count, const char *wd, tt_pipe input, tt_pipe output, tt_pipe error, tt_pipe notify);

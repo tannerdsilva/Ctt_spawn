@@ -37,6 +37,9 @@ typedef struct tt_spawn_config {
 	//internal data channels
     tt_pipe parent; //this represents the pipe that connects the the process monitor in the core application
 	tt_pipe latch; //helps synchronize the engagement between core application and container process
+	
+	//how much space is allocated for the stack allocations that are created before calling the `clone` function
+	rlim_t stack_allocation_size;
 } tt_spawn_config;
 
 //copies a spawn configuration and into new address space. this function is used to safely translate the configuration from the core application to the container process after clone is called
@@ -77,6 +80,10 @@ static tt_spawn_config tt_spawn_config_copy(tt_spawn_config *input) {
     launchConfig.stderr = input->stderr;
     launchConfig.parent = input->parent;
 	launchConfig.latch = input->latch;
+	
+	//copy the size of the stack allocation to the new structure
+	launchConfig.stack_allocation_size = input->stack_allocation_size;
+	
     return launchConfig;
 }
 
@@ -144,6 +151,9 @@ static tt_spawn_config tt_spawn_config_init(const char *path, const char **argv,
     launchConfig.stderr = stderr;
     launchConfig.parent = parent;
     launchConfig.latch = latch;
+    
+    launchConfig.stack_allocation_size = 0;
+    
     return launchConfig;
 }
 
@@ -557,26 +567,45 @@ static int tt_worker_proc(void *arg) {
     return execv(spawnConfig.path, spawnConfig.argv); //execute
 }
 //2. this is the container process
+//guarantees that the `notify` data channel will always accurately reflect the current status of this container process. the notify channel will always be notified regardless of success or error
+//returns -1 if the working directory could not be changed successfully
+//returns -2 if the environment variables could not be cleared successfully
+//exits -3 if the stack could not be allocated for the `worker process`
+//exits -4 if the the clone function failed to launch the `worker process`
 static int tt_container_proc(void *arg) {
 	//copy the configuration into an allocation created by *this* new process
     tt_spawn_config spawnConfig = tt_spawn_config_copy((tt_spawn_config*)arg);
-
+    
+    //close the necessary file handles so that we can successfully channel data back to the `core application`
 	close(spawnConfig.parent.reading); //this file handle is closed because the container process *writes* to this pipe while the core application *reads* from it
-	//unlatch from the core application
-	close(spawnConfig.latch.reading);
-	while (write(spawnConfig.latch.writing, "\n", 1) <= 0) {
-		usleep(100000); //sleep for 1/10 seconds
-	}
-	close(spawnConfig.latch.writing);
 	
 	//change the current directory of this process
     if (chdir(spawnConfig.wd) != 0) {
-        printf("there was an error trying to change the working directory");
+        notify_parent(spawnConfig.parent.writing, "f");
+
+		/* UNLATCH FROM THE CORE APPLICATION AFTER CHANNELING THE CURRRENT STATUS OF THIS PROCESS TO THE GLOBAL PROCESS MONITOR */
+		close(spawnConfig.latch.reading);
+		while (write(spawnConfig.latch.writing, "\n", 1) <= 0) {
+			usleep(100000); //sleep for 1/10 seconds
+		}
+		close(spawnConfig.latch.writing);
+
+        exit(-1);
     }
+    
 	//clear environment variables from the container process.
     int clearEnvResult = clearenv();
     if (clearenv() != 0) {
-    	printf("there was an error trying to clear the environment variables that this container inherited from the parent");
+    	notify_parent(spawnConfig.parent.writing, "f");
+
+		/* UNLATCH FROM THE CORE APPLICATION AFTER CHANNELING THE CURRRENT STATUS OF THIS PROCESS TO THE GLOBAL PROCESS MONITOR */
+		close(spawnConfig.latch.reading);
+		while (write(spawnConfig.latch.writing, "\n", 1) <= 0) {
+			usleep(100000); //sleep for 1/10 seconds
+		}
+		close(spawnConfig.latch.writing);
+
+    	exit(-2);
     }
 	
     //bind the inputs and outputs based on the given configuration structure
@@ -595,20 +624,13 @@ static int tt_container_proc(void *arg) {
 	outputBuff.i = 0;
 	tt_databuff errorBuff;
 	errorBuff.i = 0;
-	//boolean variables that represent whether or not a data channel is open and still available for **data capture**
-// 	bool input_reading_open = false;
-// 	bool output_reading_open = false;
-// 	bool error_reading_open = false;
-	//boolean variables that represent whether or not a data channel is open and still available for **data transmission**
-// 	bool input_writing_open = false;
-// 	bool output_writing_open = false;
-// 	bool error_writing_open = false;
 
 	//phase three (writing to the parent on the control channel) is executed when this boolean is enabled
 	bool parent_writable = false;
 	//event flags for the third phase
 	bool wrote_error_line = false;
 	bool wrote_output_line = false;
+	
     //stdout configuration. read the output from the workload process -> write it to the core application
     if (is_null_pipe(spawnConfig.stdout) == false) {
         tt_pipe interface_pipe = new_pipe();
@@ -673,18 +695,15 @@ static int tt_container_proc(void *arg) {
 		fcntl(interface_stdin, F_SETFD, O_NONBLOCK);
 	}
 	
-    //allocate a stack for the new process
+	//allocate a stack for the new process
     void *stack;
     void *stackTop;
-    struct rlimit stackLimit;
-    if (getrlimit(RLIMIT_STACK, &stackLimit) != 0) {
-        printf("c: There was an error trying to get the soft resource size for the stack");
+    stack = mmap(NULL, spawnConfig.stack_allocation_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    if (stack == MAP_FAILED) {
+        notify_parent(spawnConfig.parent.writing, "f");
+        exit(-3);
     }
-    stack = mmap(NULL, stackLimit.rlim_cur, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
-    stackTop = stack + stackLimit.rlim_cur;
-    if (stack == NULL) {
-        printf("c: There was an error trying to allocate stack space");
-    }
+    stackTop = stack + spawnConfig.stack_allocation_size;
 
 	//launch the worker
 	int wpid = clone(tt_worker_proc, stackTop, 0, &spawnConfig);
@@ -693,8 +712,16 @@ static int tt_container_proc(void *arg) {
 	switch(wpid) {
 		case -1:
 			//there was an error trying to launch the worker process
+			notify_parent(spawnConfig.parent.writing, "f");
 			
-			//what should I do about this? most likely, should notify the parent through the ctrl channel and then exit.
+			/* UNLATCH FROM THE CORE APPLICATION AFTER CHANNELING THE CURRRENT STATUS OF THIS PROCESS TO THE GLOBAL PROCESS MONITOR */
+			close(spawnConfig.latch.reading);
+			while (write(spawnConfig.latch.writing, "\n", 1) <= 0) {
+				usleep(100000); //sleep for 1/10 seconds
+			}
+			close(spawnConfig.latch.writing);
+			
+			exit(-4);
 			break;
 			
 		default:
@@ -705,6 +732,13 @@ static int tt_container_proc(void *arg) {
 			
 			//notify the core application that the worker process has launched
 			notify_parent_worker(spawnConfig.parent.writing, "l", wpid);
+			
+			/* UNLATCH FROM THE CORE APPLICATION AFTER CHANNELING THE CURRRENT STATUS OF THIS PROCESS TO THE GLOBAL PROCESS MONITOR */
+			close(spawnConfig.latch.reading);
+			while (write(spawnConfig.latch.writing, "\n", 1) <= 0) {
+				usleep(100000); //sleep for 1/10 seconds
+			}
+			close(spawnConfig.latch.writing);
 			
 			//here begins the main polling loop
 			while(interface_stdin != -1 || interface_stdout != -1 || interface_stderr != -1 || external_stdin != -1 || external_stdout != -1 || external_stderr != -1) {
@@ -922,32 +956,52 @@ tt_spawn_core is the primary high-level function that encompasses all functional
 - notify: the file handle that tt_spawn shall use to *write* to the global process monitor in the core application
 - latch: temporary internal io pipe that synchronizes the core application with the container process to facilitate a safe data exchange
 */
-pid_t tt_spawn_core(const char *path, const char **argv, const int argv_count, const char **env_keys, const char **env_values, int env_count, const char *wd, tt_pipe input, tt_pipe output, tt_pipe error, tt_pipe notify) {
-    pid_t lpid;
+
+/* Special return values for this function:
+	Any positive (non-zero) value: successfully launched the container process. in this case, the returned value represents the process id of the container process that was just launched.
+	-----------------
+	-2 :: there was an error trying to launch the container process
+	-3 :: there was an error trying to get the stack resource size from the system
+	-4 :: resources for the `container process` were created, however, the `clone` function still failed. the allocated resources have been freed.
+*/
+tt_spawn_result tt_spawn_core(const char *path, const char **argv, const int argv_count, const char **env_keys, const char **env_values, int env_count, const char *wd, tt_pipe input, tt_pipe output, tt_pipe error, tt_pipe notify) {
+    tt_spawn_result spawnResult;
     //allocate a stack for the container process
     void *stack;
     void *stackTop;
     struct rlimit stackLimit;
-    int result = getrlimit(RLIMIT_STACK, &stackLimit);
-    if (result != 0) {
-        printf("[tt_spawn][ERROR] :: There was an error trying to get the soft resource  size for the stack allocation that was bound to be used for the tt_spawn container process");
+    int getResourceResult = getrlimit(RLIMIT_STACK, &stackLimit);
+    if (getResourceResult != 0) {
+    	spawnResult.launchResult = -2;
+    	spawnResult.stackAllocation = NULL;
+        return spawnResult;	//return -2 because there was an error trying to get the stack resource size from the system. Without this value, we do not know how much stack space to allocate to the 
     }
     stack = mmap(NULL, stackLimit.rlim_cur, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
-    stackTop = stack + stackLimit.rlim_cur; //stacks populate their memory space in reverse order, so we need to pass the end of the buffer instead of the start of the buffer.
-    if (stack == NULL) {
-        printf("[tt_spawn][ERROR] :: There was an error trying to allocate stack space");
+    if (stack == MAP_FAILED) {
+    	spawnResult.launchResult = -3;
+    	spawnResult.stackAllocation = NULL;
+        return spawnResult;	//return -3 because there was an error trying to allocate the stack space that was to be used for the `container process`
     }
-
+	stackTop = stack + stackLimit.rlim_cur; //stacks populate their memory space in reverse order, so we need to pass the end of the buffer instead of the start of the buffer.
+	spawnResult.stackAllocation = stack;
+	
     //build a configuration structure based on the arguments passed to this function
     tt_spawn_config launchConfig = tt_spawn_config_init(path, argv, argv_count, wd, env_keys, env_values, env_count, input, output, error, notify, new_pipe());
+	launchConfig.stack_allocation_size = stackLimit.rlim_cur;
 
 	//launch the container
-	lpid = clone(tt_container_proc, stackTop, CLONE_VM | SIGCHLD, &launchConfig);
+	spawnResult.launchResult = clone(tt_container_proc, stackTop, CLONE_VM | SIGCHLD, &launchConfig);
     
 	//interpret result
-    switch(lpid) {
+    switch(spawnResult.launchResult) {
         case -1:
-            printf("[tt_spawn][ERROR] :: There was an error calling clone\n");
+        	//there was an error trying to launch the process. exit.
+        	if (munmap(stack, stackLimit.rlim_cur) == 0) {
+        		spawnResult.stackAllocation = NULL;
+        	} else {
+        		spawnResult.stackAllocation = stack;
+        	}
+            spawnResult.launchResult = -4;
             break;
 
         default: //in the core application, successfully launched container
@@ -974,5 +1028,5 @@ pid_t tt_spawn_core(const char *path, const char **argv, const int argv_count, c
 			tt_spawn_config_free(&launchConfig);
     }
     
-    return lpid;
+    return spawnResult;
 }
