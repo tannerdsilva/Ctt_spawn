@@ -900,8 +900,8 @@ static int tt_container_proc(void *arg) {
 				//## end phase three
 			} // end main loop
 			
-			i = 0;
-			while (notify_parent(spawnConfig.parent.writing, "x") == false) {
+			int i = 0;
+			while (notify_parent(spawnConfig.parent.writing, "x") == false && i < 100) {
 				i = i + 1;
 			}
 			break;
